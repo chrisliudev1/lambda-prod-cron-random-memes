@@ -47,45 +47,40 @@ const getDriveClient = () => {
 };
 
 const drive = getDriveClient();
+const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
-
-exports.handler = async (event) => {
+let handler = async (event) => {
 
   try {
-    const { fileIds } = JSON.parse(event.body);
+    // List all files in the specified folder
+    const res = await drive.files.list({
+      q: `'${folderId}' in parents and mimeType contains 'image/'`,  // Filter for image files
+      fields: 'files(id, name, mimeType)',
+    });
     const results = [];
 
-    for (const fileId of fileIds) {
-      // Skip if already saved
-      const [existing] = await connection.execute(
+    for (const file of res.data.files) {
+      const { id: fileId, mimeType } = file;
+
+      // Check if file is already processed
+      const existing = await connection.query(
         'SELECT id FROM random_meme WHERE id = ? LIMIT 1',
         [fileId]
       );
       if (existing.length > 0) {
-        console.log(`Already exists: ${fileId}`);
+        console.log(`Already processed: ${fileId}`);
         continue;
       }
 
-      // Get file info
-      const meta = await drive.files.get({
-        fileId,
-        fields: 'id, name, mimeType',
-      });
-
-      const { mimeType } = meta.data;
-      if (!mimeType.startsWith('image/')) {
-        console.log(`Skipping non-image: ${fileId}`);
-        continue;
-      }
-
-      const file = await drive.files.get(
+      // Download file from Google Drive
+      const fileContent = await drive.files.get(
         { fileId, alt: 'media' },
         { responseType: 'arraybuffer' }
       );
-      const buffer = Buffer.from(file.data);
+      const buffer = Buffer.from(fileContent.data);
 
       let extension = mimeType.split('/')[1];
-      if (extension === 'jpeg') extension = 'jpg';
+      if (extension === 'jpeg') extension = 'jpg';  // Normalize jpeg to jpg
 
       const s3Key = `random-memes/${fileId}.${extension}`;
 
@@ -106,7 +101,7 @@ exports.handler = async (event) => {
       });   
 
       // Save just the S3 key in DB
-      await connection.execute(
+      await connection.query(
         'INSERT INTO random_meme (id, path) VALUES (?, ?)',
         [fileId, s3Key]
       );
@@ -114,7 +109,7 @@ exports.handler = async (event) => {
       results.push({ id: fileId, s3Key });
     }
 
-    db.close();
+    connection.close();
     console.log('db closed');
 
     return {
@@ -130,3 +125,9 @@ exports.handler = async (event) => {
     };
   }
 };
+
+if (CKUtils.isLambda()) {
+  exports.handler = handler;
+} else {
+  handler();
+}

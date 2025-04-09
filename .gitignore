@@ -6,7 +6,7 @@
 .env
 *.sh
 *.xml
-sitemaps/
+random-memes/
 
 # Node artifact files
 node_modules/
