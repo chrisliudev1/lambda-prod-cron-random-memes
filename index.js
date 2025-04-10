@@ -3,6 +3,7 @@
 // CREATE TABLE random_meme (
 //   id VARCHAR(255) PRIMARY KEY,
 //   path VARCHAR(512) NOT NULL,
+//   category VARCHAR(255) DEFAULT NULL,
 //   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 // );
 
@@ -12,7 +13,8 @@ const CKUtils = require('./utils/ck-utils').CKUtils;
 const { google } = require('googleapis');
 
 const process = require('process');
-const fs = require('fs');
+// const fs = require('fs');
+// const path = require('path');
 
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 const s3 = new S3Client({ region: 'us-east-1' });
@@ -47,66 +49,96 @@ const getDriveClient = () => {
 };
 
 const drive = getDriveClient();
-const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+const rootFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
 let handler = async (event) => {
+  const results = [];
 
-  try {
-    // List all files in the specified folder
+  const getSubfolders = async (parentId) => {
     const res = await drive.files.list({
-      q: `'${folderId}' in parents and mimeType contains 'image/'`,  // Filter for image files
+      q: `'${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+      fields: 'files(id, name)',
+    });
+    return res.data.files;
+  };
+
+  const getImageFilesInFolder = async (folderId) => {
+    const res = await drive.files.list({
+      q: `'${folderId}' in parents and mimeType contains 'image/' and trashed = false`,
       fields: 'files(id, name, mimeType)',
     });
-    const results = [];
+    return res.data.files;
+  };
 
-    for (const file of res.data.files) {
-      const { id: fileId, mimeType } = file;
+  const processImageFile = async (file, category) => {
+    const { id: fileId, mimeType } = file;
 
-      // Check if file is already processed
-      const existing = await connection.query(
-        'SELECT id FROM random_meme WHERE id = ? LIMIT 1',
-        [fileId]
-      );
-      if (existing.length > 0) {
-        console.log(`Already processed: ${fileId}`);
-        continue;
+    // Check if file is already processed
+    const existing = await connection.query(
+      'SELECT id FROM random_meme WHERE id = ? LIMIT 1',
+      [fileId]
+    );
+    if (existing.length > 0) {
+      console.log(`Already processed: ${fileId}`);
+      return;
+    }
+    const response = await drive.files.get(
+      { fileId, alt: 'media' },
+      { responseType: 'arraybuffer' }
+    );
+    const buffer = Buffer.from(response.data);
+
+    let extension = mimeType.split('/')[1];
+    if (extension === 'jpeg') extension = 'jpg';
+
+    const s3Key = `random-memes/${category}/${fileId}.${extension}`;
+    // const directory = path.dirname(s3Key);
+
+    // if (!fs.existsSync(directory)) {
+    //   fs.mkdirSync(directory, { recursive: true });
+    // }
+
+    // if (!CKUtils.isLambda()) fs.writeFileSync(`${s3Key}`, buffer);
+
+    // Upload to S3
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: s3Bucket,
+        Key: s3Key,
+        Body: buffer,
+        ContentType: mimeType,
+        ACL: 'public-read',
+      })
+    )
+    .then(() => {
+        console.log(`${s3Key} Sent to S3`);
+    }); 
+
+    await connection.query(
+      'INSERT IGNORE INTO random_meme (id, path, category) VALUES (?, ?, ?)',
+      [fileId, s3Key, category]
+    );
+
+    results.push({ id: fileId, s3Key, category });
+  };
+
+  try {
+    // 1. Process root folder images first
+    const rootImages = await getImageFilesInFolder(rootFolderId);
+    for (const file of rootImages) {
+      await processImageFile(file, 'root');
+    }
+
+    // 2. Process each subfolder as category
+    const folders = await getSubfolders(rootFolderId);
+
+    for (const folder of folders) {
+      const { id: folderId, name: category } = folder;
+      const imageFiles = await getImageFilesInFolder(folderId);
+
+      for (const file of imageFiles) {
+        await processImageFile(file, category);
       }
-
-      // Download file from Google Drive
-      const fileContent = await drive.files.get(
-        { fileId, alt: 'media' },
-        { responseType: 'arraybuffer' }
-      );
-      const buffer = Buffer.from(fileContent.data);
-
-      let extension = mimeType.split('/')[1];
-      if (extension === 'jpeg') extension = 'jpg';  // Normalize jpeg to jpg
-
-      const s3Key = `random-memes/${fileId}.${extension}`;
-
-      if (!CKUtils.isLambda()) fs.writeFileSync(`${s3Key}`, buffer);
-
-      // Upload to S3
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: s3Bucket,
-          Key: s3Key,
-          Body: buffer,
-          ContentType: mimeType,
-          ACL: 'public-read',
-        })
-      )
-      .then(() => {
-          console.log(`${s3Key} Sent to S3`);
-      });   
-
-      // Save just the S3 key in DB
-      await connection.query(
-        'INSERT INTO random_meme (id, path) VALUES (?, ?)',
-        [fileId, s3Key]
-      );
-
-      results.push({ id: fileId, s3Key });
     }
 
     connection.close();
@@ -114,7 +146,7 @@ let handler = async (event) => {
 
     return {
       statusCode: 200,
-      body: JSON.stringify({ success: true, images: results }),
+      body: JSON.stringify({ success: true, processed: results }),
     };
 
   } catch (err) {
