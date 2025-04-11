@@ -1,12 +1,3 @@
-// zip -r function.zip .
-
-// CREATE TABLE random_meme (
-//   id VARCHAR(255) PRIMARY KEY,
-//   path VARCHAR(512) NOT NULL,
-//   category VARCHAR(255) DEFAULT NULL,
-//   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-// );
-
 const CKMySQL = require('./utils/ck-mysql').CKMySQL;
 const CKUtils = require('./utils/ck-utils').CKUtils;
 
